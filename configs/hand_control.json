@@ -1,0 +1,23 @@
+{
+  "camera_index": 0,
+  "width": 640,
+  "height": 480,
+  "window_title": "Camera Feed",
+  "window_position": "top-right",
+  "min_detection_confidence": 0.5,
+  "min_tracking_confidence": 0.5,
+  "native_logs": false,
+  "verbose": false,
+  "click_hold_seconds": 1.5,
+  "click_radius": 0.025,
+  "click_cooldown_seconds": 3.0,
+  "wave_window_seconds": 1.2,
+  "wave_min_span": 0.12,
+  "wave_min_direction_changes": 4,
+  "mouse_smoothing": 0.4,
+  "mouse_deadzone": 0.002,
+  "mouse_edge_padding": 0.005,
+  "control_margin": 0.08,
+  "control_gain": 1.25,
+  "exit_hold_seconds": 0.6
+}
