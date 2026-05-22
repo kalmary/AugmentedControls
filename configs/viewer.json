@@ -1,11 +1,9 @@
 {
   "camera_index": 0,
-  "width": 640,
-  "height": 480,
+  "width": 880,
+  "height": 620,
   "window_title": "Camera Feed",
   "window_position": "top-right",
-  "min_detection_confidence": 0.5,
-  "min_tracking_confidence": 0.5,
   "native_logs": false,
   "verbose": false
 }

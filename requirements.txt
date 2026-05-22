@@ -1,3 +1,4 @@
 mediapipe==0.10.15
 opencv-python>=4.9.0,<4.12
 pynput>=1.8.1
+PyQt6>=6.7

@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import dataclass
 import logging
 import os
 import shutil
@@ -8,7 +9,7 @@ import time
 
 import cv2
 
-from detectors import DetectionFlags, DetectionThresholds, LandmarkDetector
+from detectors import DetectionConfidences, DetectionFlags, DetectionThresholds, LandmarkDetector
 
 
 WINDOW_POSITIONS = (
@@ -19,6 +20,16 @@ WINDOW_POSITIONS = (
 )
 
 _LAST_TOPMOST_REFRESH: dict[str, float] = {}
+_WINDOW_GEOMETRY: dict[str, "WindowGeometry"] = {}
+_MISSING_TOPMOST_TOOLS_LOGGED = False
+
+
+@dataclass(frozen=True)
+class WindowGeometry:
+    x: int
+    y: int
+    width: int
+    height: int
 
 
 def detect_screen_size() -> tuple[int, int] | None:
@@ -53,25 +64,42 @@ def configure_camera_window(
         screen_width, screen_height = screen_size
         x = 12 if "left" in window_position else max(0, screen_width - window_width - 12)
         y = 12 if "top" in window_position else max(0, screen_height - window_height - 48)
-        cv2.moveWindow(window_title, x, y)
     else:
-        cv2.moveWindow(window_title, 100000, 0)
+        x = 100000
+        y = 0
 
+    cv2.moveWindow(window_title, x, y)
+    _WINDOW_GEOMETRY[window_title] = WindowGeometry(x, y, window_width, window_height)
     keep_camera_window_topmost(window_title)
 
 
 def keep_camera_window_topmost(window_title: str) -> None:
+    global _MISSING_TOPMOST_TOOLS_LOGGED
+
     try:
         cv2.setWindowProperty(window_title, cv2.WND_PROP_TOPMOST, 1)
     except cv2.error:
         logging.debug("OpenCV topmost window property is not supported on this platform.")
 
     now = time.monotonic()
-    if now - _LAST_TOPMOST_REFRESH.get(window_title, 0.0) < 1.0:
+    if now - _LAST_TOPMOST_REFRESH.get(window_title, 0.0) < 0.2:
         return
     _LAST_TOPMOST_REFRESH[window_title] = now
 
+    geometry = _WINDOW_GEOMETRY.get(window_title)
+    if geometry:
+        try:
+            cv2.resizeWindow(window_title, geometry.width, geometry.height)
+            cv2.moveWindow(window_title, geometry.x, geometry.y)
+        except cv2.error:
+            logging.debug("OpenCV window placement refresh failed.", exc_info=True)
+
     if not shutil.which("wmctrl"):
+        if not _MISSING_TOPMOST_TOOLS_LOGGED:
+            logging.info(
+                "Install wmctrl if your desktop lets the camera window fall behind other apps."
+            )
+            _MISSING_TOPMOST_TOOLS_LOGGED = True
         return
 
     try:
@@ -118,8 +146,7 @@ def run_camera_feed(
     cap: cv2.VideoCapture,
     window_title: str,
     thresholds: DetectionThresholds,
-    min_detection_confidence: float,
-    min_tracking_confidence: float,
+    confidences: DetectionConfidences,
     flags: DetectionFlags,
     window_position: str = "top-right",
 ) -> int:
@@ -131,8 +158,7 @@ def run_camera_feed(
     with LandmarkDetector(
         thresholds,
         flags,
-        min_detection_confidence,
-        min_tracking_confidence,
+        confidences,
     ) as detector:
         while True:
             ret, frame = cap.read()

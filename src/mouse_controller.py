@@ -27,6 +27,7 @@ class MouseController:
         smoothing: float = 0.35,
         deadzone: float = 0.002,
         edge_padding: float = 0.02,
+        edge_padding_pixels: int | None = None,
         min_interval_seconds: float = 0.0,
         screen_size: tuple[int, int] | None = None,
         mouse_backend=None,
@@ -38,17 +39,21 @@ class MouseController:
             raise ValueError("deadzone must be between 0.0 and 1.0")
         if not 0.0 <= edge_padding < 0.5:
             raise ValueError("edge_padding must be between 0.0 and 0.5")
+        if edge_padding_pixels is not None and edge_padding_pixels < 0:
+            raise ValueError("edge_padding_pixels must be non-negative")
         if min_interval_seconds < 0.0:
             raise ValueError("min_interval_seconds must be non-negative")
 
         self.smoothing = smoothing
         self.deadzone = deadzone
         self.edge_padding = edge_padding
+        self.edge_padding_pixels = edge_padding_pixels
         self.min_interval_seconds = min_interval_seconds
         self.clock = clock
         self.mouse = mouse_backend or self._create_mouse_controller()
         self.screen_size = screen_size or self._detect_screen_size(self.mouse)
         self._last_position: NormalizedPoint | None = None
+        self._last_pixel_position: tuple[int, int] | None = None
         self._last_move_time = 0.0
 
     def move_to_normalized(self, x: float, y: float) -> tuple[int, int] | None:
@@ -64,17 +69,25 @@ class MouseController:
         pixel_position = self._to_screen_position(smoothed)
         self.mouse.position = pixel_position
         self._last_position = smoothed
+        self._last_pixel_position = pixel_position
         self._last_move_time = now
         return pixel_position
 
     def reset_smoothing(self) -> None:
         self._last_position = None
+        self._last_pixel_position = None
 
     def click_left(self) -> None:
         self.mouse.click(Button.left)
 
     def screen_dimensions(self) -> tuple[int, int]:
         return self.screen_size
+
+    def workspace_padding(self) -> tuple[float, float]:
+        return self._edge_padding_by_axis()
+
+    def last_pixel_position(self) -> tuple[int, int] | None:
+        return self._last_pixel_position
 
     def _smooth_point(self, target: NormalizedPoint) -> NormalizedPoint:
         if self._last_position is None:
@@ -88,11 +101,10 @@ class MouseController:
         )
 
     def _clamp_point(self, point: NormalizedPoint) -> NormalizedPoint:
-        minimum = self.edge_padding
-        maximum = 1.0 - self.edge_padding
+        x_padding, y_padding = self._edge_padding_by_axis()
         return NormalizedPoint(
-            x=min(max(point.x, minimum), maximum),
-            y=min(max(point.y, minimum), maximum),
+            x=min(max(point.x, x_padding), 1.0 - x_padding),
+            y=min(max(point.y, y_padding), 1.0 - y_padding),
         )
 
     def _to_screen_position(self, point: NormalizedPoint) -> tuple[int, int]:
@@ -100,6 +112,16 @@ class MouseController:
         return (
             round(point.x * (width - 1)),
             round(point.y * (height - 1)),
+        )
+
+    def _edge_padding_by_axis(self) -> tuple[float, float]:
+        if self.edge_padding_pixels is None:
+            return self.edge_padding, self.edge_padding
+
+        width, height = self.screen_size
+        return (
+            min(self.edge_padding_pixels / max(width - 1, 1), 0.499),
+            min(self.edge_padding_pixels / max(height - 1, 1), 0.499),
         )
 
     @staticmethod
@@ -255,6 +277,7 @@ def run_self_test() -> None:
         {"deadzone": 1.1},
         {"edge_padding": -0.1},
         {"edge_padding": 0.5},
+        {"edge_padding_pixels": -1},
         {"min_interval_seconds": -0.1},
     ):
         try:
@@ -267,6 +290,17 @@ def run_self_test() -> None:
             pass
         else:
             raise AssertionError(f"Expected ValueError for {kwargs}")
+
+    mouse = _FakeMouse()
+    controller = MouseController(
+        smoothing=0.0,
+        deadzone=0.0,
+        edge_padding=0.0,
+        edge_padding_pixels=1,
+        screen_size=(1001, 501),
+        mouse_backend=mouse,
+    )
+    assert controller.move_to_normalized(0.0, 1.0) == (1, 499)
 
     print("The cursor will move to center, left, right, and center again.")
     print("Starting in 2 seconds...")

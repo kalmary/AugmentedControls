@@ -9,6 +9,7 @@ import mediapipe as mp
 
 from mouse_controller import MouseController, temporary_remote_control_permission
 from camera import configure_camera_window, keep_camera_window_topmost
+from dwell_cursor import DwellOverlay
 
 
 mp_drawing = mp.solutions.drawing_utils
@@ -22,6 +23,7 @@ class HandControlConfig:
     min_tracking_confidence: float
     click_hold_seconds: float
     click_radius: float
+    click_grace_seconds: float
     click_cooldown_seconds: float
     wave_window_seconds: float
     wave_min_span: float
@@ -29,10 +31,26 @@ class HandControlConfig:
     mouse_smoothing: float
     mouse_deadzone: float
     mouse_edge_padding: float
+    mouse_edge_padding_pixels: int | None
+    dwell_cursor_enabled: bool
+    dwell_cursor_radius: int | None
+    dwell_cursor_diameter_pixels: int
+    dwell_cursor_base_alpha: float
+    dwell_cursor_fill_alpha: float
+    dwell_cursor_workspace_alpha: float
     control_margin: float
     control_gain: float
+    control_acceleration: float
+    control_acceleration_threshold: float
     window_position: str
     exit_hold_seconds: float
+
+
+@dataclass(frozen=True)
+class TrackedPoint:
+    x: float
+    y: float
+    visibility: float
 
 
 @dataclass
@@ -70,19 +88,40 @@ class WaveTracker:
 
 
 class DwellClicker:
-    def __init__(self, hold_seconds: float, radius: float, cooldown_seconds: float) -> None:
+    def __init__(
+        self,
+        hold_seconds: float,
+        radius: float,
+        grace_seconds: float,
+        cooldown_seconds: float,
+    ) -> None:
         self.hold_seconds = hold_seconds
         self.radius = radius
+        self.grace_seconds = grace_seconds
         self.cooldown_seconds = cooldown_seconds
         self.anchor: tuple[float, float] | None = None
         self.anchor_time = 0.0
+        self.outside_since: float | None = None
         self.last_click_time = 0.0
 
     def update(self, now: float, point: tuple[float, float]) -> bool:
-        if self.anchor is None or self._distance(self.anchor, point) > self.radius:
+        if self.anchor is None:
             self.anchor = point
             self.anchor_time = now
+            self.outside_since = None
             return False
+
+        if self._distance(self.anchor, point) > self.radius:
+            if self.outside_since is None:
+                self.outside_since = now
+            if now - self.outside_since < self.grace_seconds:
+                return False
+            self.anchor = point
+            self.anchor_time = now
+            self.outside_since = None
+            return False
+
+        self.outside_since = None
 
         if now - self.last_click_time < self.cooldown_seconds:
             return False
@@ -95,20 +134,42 @@ class DwellClicker:
         self.anchor_time = now
         return True
 
+    def progress(self, now: float, point: tuple[float, float]) -> float:
+        if self.anchor is None or self._distance(self.anchor, point) > self.radius:
+            if self.outside_since is None or now - self.outside_since < self.grace_seconds:
+                return min(max((now - self.anchor_time) / self.hold_seconds, 0.0), 1.0)
+            return 0.0
+        if now - self.last_click_time < self.cooldown_seconds:
+            return 0.0
+        return min(max((now - self.anchor_time) / self.hold_seconds, 0.0), 1.0)
+
     @staticmethod
     def _distance(first: tuple[float, float], second: tuple[float, float]) -> float:
         return max(abs(first[0] - second[0]), abs(first[1] - second[1]))
 
 
 class AdaptiveControlMapper:
-    def __init__(self, margin: float, gain: float) -> None:
+    def __init__(
+        self,
+        margin: float,
+        gain: float,
+        acceleration: float,
+        acceleration_threshold: float,
+    ) -> None:
         if not 0.0 <= margin < 0.5:
             raise ValueError("control margin must be between 0.0 and 0.5")
         if gain <= 0.0:
             raise ValueError("control gain must be positive")
+        if acceleration < 1.0:
+            raise ValueError("control acceleration must be at least 1.0")
+        if not 0.0 < acceleration_threshold < 1.0:
+            raise ValueError("control acceleration threshold must be between 0.0 and 1.0")
 
         self.margin = margin
         self.gain = gain
+        self.acceleration = acceleration
+        self.acceleration_threshold = acceleration_threshold
+        self.bounds_alpha = 0.2
         self.min_x: float | None = None
         self.max_x: float | None = None
         self.min_y: float | None = None
@@ -129,10 +190,17 @@ class AdaptiveControlMapper:
         )
 
     def _update_bounds(self, x: float, y: float) -> None:
-        self.min_x = x if self.min_x is None else min(self.min_x, x)
-        self.max_x = x if self.max_x is None else max(self.max_x, x)
-        self.min_y = y if self.min_y is None else min(self.min_y, y)
-        self.max_y = y if self.max_y is None else max(self.max_y, y)
+        self.min_x = self._smooth_bound(self.min_x, x, min)
+        self.max_x = self._smooth_bound(self.max_x, x, max)
+        self.min_y = self._smooth_bound(self.min_y, y, min)
+        self.max_y = self._smooth_bound(self.max_y, y, max)
+
+    def _smooth_bound(self, current: float | None, value: float, choose) -> float:
+        if current is None:
+            return value
+
+        target = choose(current, value)
+        return current + (target - current) * self.bounds_alpha
 
     def _map_axis(self, value: float, axis_min: float | None, axis_max: float | None) -> float:
         if axis_min is None or axis_max is None:
@@ -141,8 +209,24 @@ class AdaptiveControlMapper:
         center = (axis_min + axis_max) / 2.0
         span = max(axis_max - axis_min, 0.12)
         control_span = max(0.05, (span + self.margin * 2.0) / self.gain)
-        mapped = 0.5 + (value - center) / control_span
-        return min(max(mapped, 0.0), 1.0)
+        normalized_delta = (value - center) / control_span
+        mapped = 0.5 + self._accelerate_delta(normalized_delta)
+        mapped = min(max(mapped, 0.0), 1.0)
+        if mapped <= 0.025:
+            return 0.0
+        if mapped >= 0.975:
+            return 1.0
+        return mapped
+
+    def _accelerate_delta(self, delta: float) -> float:
+        sign = 1.0 if delta >= 0.0 else -1.0
+        magnitude = abs(delta)
+        if magnitude <= self.acceleration_threshold:
+            return sign * magnitude / self.acceleration
+
+        slow_part = self.acceleration_threshold / self.acceleration
+        fast_part = (magnitude - self.acceleration_threshold) * self.acceleration
+        return sign * (slow_part + fast_part)
 
 
 class HandControlMode:
@@ -158,9 +242,15 @@ class HandControlMode:
         self.dwell_clicker = DwellClicker(
             config.click_hold_seconds,
             config.click_radius,
+            config.click_grace_seconds,
             config.click_cooldown_seconds,
         )
-        self.control_mapper = AdaptiveControlMapper(config.control_margin, config.control_gain)
+        self.control_mapper = AdaptiveControlMapper(
+            config.control_margin,
+            config.control_gain,
+            config.control_acceleration,
+            config.control_acceleration_threshold,
+        )
         self.crossed_arms_since: float | None = None
 
     def run(self, cap: cv2.VideoCapture, window_title: str) -> int:
@@ -174,46 +264,78 @@ class HandControlMode:
                 smoothing=self.config.mouse_smoothing,
                 deadzone=self.config.mouse_deadzone,
                 edge_padding=self.config.mouse_edge_padding,
+                edge_padding_pixels=self.config.mouse_edge_padding_pixels,
             )
             screen_width, screen_height = mouse_controller.screen_dimensions()
             logging.info("Detected screen size: %sx%s", screen_width, screen_height)
-            configure_camera_window(
-                window_title,
-                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                self.config.window_position,
+            dwell_overlay = (
+                DwellOverlay(
+                    (screen_width, screen_height),
+                    mouse_controller.workspace_padding(),
+                    diameter_pixels=self._dwell_cursor_diameter_pixels(),
+                    base_alpha=self.config.dwell_cursor_base_alpha,
+                    fill_alpha=self.config.dwell_cursor_fill_alpha,
+                    workspace_alpha=self.config.dwell_cursor_workspace_alpha,
+                )
+                if self.config.dwell_cursor_enabled
+                else None
             )
+            try:
+                configure_camera_window(
+                    window_title,
+                    int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    self.config.window_position,
+                )
 
-            with mp_pose.Pose(
-                min_detection_confidence=self.config.min_detection_confidence,
-                min_tracking_confidence=self.config.min_tracking_confidence,
-            ) as pose:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        logging.error("Failed to read frame from camera")
-                        return 1
+                with mp_pose.Pose(
+                    min_detection_confidence=self.config.min_detection_confidence,
+                    min_tracking_confidence=self.config.min_tracking_confidence,
+                ) as pose:
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            logging.error("Failed to read frame from camera")
+                            return 1
 
-                    frame = cv2.flip(frame, 1)
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    rgb_frame.flags.writeable = False
-                    pose_results = pose.process(rgb_frame)
-                    rgb_frame.flags.writeable = True
+                        frame = cv2.flip(frame, 1)
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        rgb_frame.flags.writeable = False
+                        pose_results = pose.process(rgb_frame)
+                        rgb_frame.flags.writeable = True
 
-                    self.pose_visible = bool(pose_results.pose_landmarks)
-                    if pose_results.pose_landmarks:
-                        should_exit = self._handle_pose(frame, pose_results.pose_landmarks, mouse_controller)
-                        if should_exit:
-                            logging.info("Exit gesture detected.")
+                        self.pose_visible = bool(pose_results.pose_landmarks)
+                        if pose_results.pose_landmarks:
+                            should_exit = self._handle_pose(
+                                frame,
+                                pose_results.pose_landmarks,
+                                mouse_controller,
+                                dwell_overlay,
+                            )
+                            if should_exit:
+                                logging.info("Exit gesture detected.")
+                                return 0
+                        else:
+                            if dwell_overlay:
+                                dwell_overlay.hide()
+                            self._forget_active_hand("Body tracking lost; wave again to select a hand.")
+
+                        self._draw_mode_status(frame)
+                        cv2.imshow(window_title, frame)
+                        keep_camera_window_topmost(window_title)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            logging.info("Quit requested")
                             return 0
+            finally:
+                if dwell_overlay:
+                    dwell_overlay.close()
 
-                    self._draw_mode_status(frame)
-                    cv2.imshow(window_title, frame)
-                    keep_camera_window_topmost(window_title)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        logging.info("Quit requested")
-                        return 0
-
-    def _handle_pose(self, frame, pose_landmarks, mouse_controller: MouseController) -> bool:
+    def _handle_pose(
+        self,
+        frame,
+        pose_landmarks,
+        mouse_controller: MouseController,
+        dwell_overlay: DwellOverlay | None,
+    ) -> bool:
         mp_drawing.draw_landmarks(
             frame,
             pose_landmarks,
@@ -233,21 +355,23 @@ class HandControlMode:
         arms = {
             "Left": (
                 pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER],
-                pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST],
+                self._hand_point(pose_landmarks.landmark, "Left"),
             ),
             "Right": (
                 pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER],
-                pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_WRIST],
+                self._hand_point(pose_landmarks.landmark, "Right"),
             ),
         }
 
-        for label, (_, wrist) in arms.items():
-            if wrist.visibility < 0.5:
+        self._forget_active_hand_if_lost(arms)
+
+        for label, (_, hand) in arms.items():
+            if hand.visibility < 0.5:
                 continue
 
             tracker = self.wave_trackers.get(label)
             if tracker:
-                tracker.add(now, wrist.x, self.config.wave_window_seconds)
+                tracker.add(now, hand.x, self.config.wave_window_seconds)
                 if self.user_accepted and tracker.is_wave(
                     self.config.wave_min_span,
                     self.config.wave_min_direction_changes,
@@ -260,35 +384,112 @@ class HandControlMode:
                     tracker.reset()
                     mouse_controller.reset_smoothing()
                     self.control_mapper.reset()
-                    self.dwell_clicker.anchor = None
+                    self._reset_click_state()
                     logging.info("%s hand selected for mouse control.", label)
 
         if not self.user_accepted or not self.active_hand_label:
+            if dwell_overlay:
+                dwell_overlay.hide()
             return False
 
         active_arm = arms.get(self.active_hand_label)
         if not active_arm:
+            if dwell_overlay:
+                dwell_overlay.hide()
             return False
 
         normalized_point = self._arm_pointing_position(*active_arm)
         if normalized_point is None:
+            if dwell_overlay:
+                dwell_overlay.hide()
             return False
 
         mapped_point = self.control_mapper.map(normalized_point)
         mouse_controller.move_to_normalized(*mapped_point)
+        click_progress = self.dwell_clicker.progress(now, mapped_point)
+
+        if dwell_overlay:
+            pixel_position = mouse_controller.last_pixel_position()
+            if pixel_position:
+                dwell_overlay.update(pixel_position, click_progress)
 
         if self.dwell_clicker.update(now, mapped_point):
             mouse_controller.click_left()
             logging.info("Mouse click.")
         return False
 
+    def _dwell_cursor_diameter_pixels(self) -> int:
+        if self.config.dwell_cursor_radius is not None:
+            return self.config.dwell_cursor_radius * 2
+
+        return max(self.config.dwell_cursor_diameter_pixels, 14)
+
+    def _forget_active_hand_if_lost(self, arms) -> None:
+        if not self.active_hand_label:
+            return
+
+        active_arm = arms.get(self.active_hand_label)
+        if not active_arm:
+            self._forget_active_hand("Selected hand tracking lost; wave again to select a hand.")
+            return
+
+        _, hand = active_arm
+        if hand.visibility < 0.5:
+            self._forget_active_hand("Selected hand tracking lost; wave again to select a hand.")
+
+    def _forget_active_hand(self, message: str) -> None:
+        if not self.active_hand_label:
+            return
+
+        self.active_hand_label = None
+        self.control_mapper.reset()
+        self._reset_click_state()
+        for tracker in self.wave_trackers.values():
+            tracker.reset()
+        logging.info(message)
+
+    def _reset_click_state(self) -> None:
+        self.dwell_clicker.anchor = None
+        self.dwell_clicker.outside_since = None
+
     @staticmethod
-    def _arm_pointing_position(shoulder, wrist) -> tuple[float, float] | None:
-        if shoulder.visibility < 0.5 or wrist.visibility < 0.5:
+    def _hand_point(pose_landmarks, physical_label: str) -> TrackedPoint:
+        if physical_label == "Left":
+            indices = (
+                mp_pose.PoseLandmark.RIGHT_WRIST,
+                mp_pose.PoseLandmark.RIGHT_INDEX,
+                mp_pose.PoseLandmark.RIGHT_PINKY,
+            )
+        else:
+            indices = (
+                mp_pose.PoseLandmark.LEFT_WRIST,
+                mp_pose.PoseLandmark.LEFT_INDEX,
+                mp_pose.PoseLandmark.LEFT_PINKY,
+            )
+
+        visible_points = [
+            pose_landmarks[index]
+            for index in indices
+            if pose_landmarks[index].visibility >= 0.35
+        ]
+        if not visible_points:
+            wrist = pose_landmarks[indices[0]]
+            return TrackedPoint(wrist.x, wrist.y, wrist.visibility)
+
+        total_visibility = sum(point.visibility for point in visible_points)
+        return TrackedPoint(
+            sum(point.x * point.visibility for point in visible_points) / total_visibility,
+            sum(point.y * point.visibility for point in visible_points) / total_visibility,
+            max(point.visibility for point in visible_points),
+        )
+
+    @staticmethod
+    def _arm_pointing_position(shoulder, hand) -> tuple[float, float] | None:
+        if shoulder.visibility < 0.5 or hand.visibility < 0.5:
             return None
 
-        direction_x = wrist.x - shoulder.x
-        direction_y = wrist.y - shoulder.y
+        direction_x = hand.x - shoulder.x
+        direction_y = hand.y - shoulder.y
         arm_length = max(abs(direction_x), abs(direction_y))
         if arm_length < 0.08:
             return None
@@ -345,20 +546,12 @@ class HandControlMode:
     def _arms_are_crossed_near_body(pose_landmarks) -> bool:
         left_wrist = pose_landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
         right_wrist = pose_landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
-        left_elbow = pose_landmarks[mp_pose.PoseLandmark.LEFT_ELBOW]
-        right_elbow = pose_landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW]
         left_shoulder = pose_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
 
-        landmarks = (
-            left_wrist,
-            right_wrist,
-            left_elbow,
-            right_elbow,
-            left_shoulder,
-            right_shoulder,
-        )
-        if any(landmark.visibility < 0.5 for landmark in landmarks):
+        if left_wrist.visibility < 0.55 or right_wrist.visibility < 0.55:
+            return False
+        if left_shoulder.visibility < 0.5 or right_shoulder.visibility < 0.5:
             return False
 
         shoulder_left_x = min(left_shoulder.x, right_shoulder.x)
@@ -367,22 +560,20 @@ class HandControlMode:
         shoulder_y = (left_shoulder.y + right_shoulder.y) / 2.0
         chest_center_x = (left_shoulder.x + right_shoulder.x) / 2.0
 
-        wrists_near_center = (
-            abs(left_wrist.x - chest_center_x) <= shoulder_width * 0.6
-            and abs(right_wrist.x - chest_center_x) <= shoulder_width * 0.6
-            and abs(left_wrist.x - right_wrist.x) <= shoulder_width * 0.7
+        wrists_inside_chest_width = (
+            shoulder_left_x - shoulder_width * 0.2 <= left_wrist.x <= shoulder_right_x + shoulder_width * 0.2
+            and shoulder_left_x - shoulder_width * 0.2 <= right_wrist.x <= shoulder_right_x + shoulder_width * 0.2
         )
         wrists_near_chest = (
-            shoulder_y - 0.06 <= left_wrist.y <= shoulder_y + 0.38
-            and shoulder_y - 0.06 <= right_wrist.y <= shoulder_y + 0.38
+            shoulder_y - 0.14 <= left_wrist.y <= shoulder_y + 0.55
+            and shoulder_y - 0.14 <= right_wrist.y <= shoulder_y + 0.55
         )
-        forearms_cross = HandControlMode._segments_intersect(
-            (left_elbow.x, left_elbow.y),
-            (left_wrist.x, left_wrist.y),
-            (right_elbow.x, right_elbow.y),
-            (right_wrist.x, right_wrist.y),
+        wrists_close_together = (
+            abs(left_wrist.x - right_wrist.x) <= shoulder_width * 0.65
+            and abs(left_wrist.y - right_wrist.y) <= shoulder_width * 0.45
+            and abs(((left_wrist.x + right_wrist.x) / 2.0) - chest_center_x) <= shoulder_width * 0.35
         )
-        return wrists_near_center and wrists_near_chest and forearms_cross
+        return wrists_inside_chest_width and wrists_near_chest and wrists_close_together
 
     @staticmethod
     def _segments_intersect(

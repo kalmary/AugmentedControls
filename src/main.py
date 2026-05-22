@@ -16,7 +16,7 @@ warnings.filterwarnings(
 
 from camera import cleanup, open_camera, run_camera_feed, suppress_native_stderr
 from config import ConfigError, config_value, load_config
-from detectors import DetectionFlags, DetectionThresholds
+from detectors import DetectionConfidences, DetectionFlags, DetectionThresholds
 
 
 CONTROL_MODES = (
@@ -80,6 +80,10 @@ def load_detector_config(name: str, enabled: bool) -> dict:
     return load_config(name)
 
 
+def confidence_value(config: dict, key: str) -> float:
+    return float(config_value(config, key, 0.5))
+
+
 def main() -> int:
     args = parse_args()
     flags = DetectionFlags(
@@ -88,7 +92,7 @@ def main() -> int:
         face=args.face,
     )
     try:
-        pose_config = load_detector_config("pose", flags.pose)
+        pose_config = load_detector_config("pose", flags.pose or args.mode == "hand-control")
         hand_config = load_detector_config("hand", flags.hand)
         face_config = load_detector_config("face", flags.face)
         mode_config = load_config(MODE_CONFIGS[args.mode])
@@ -101,6 +105,14 @@ def main() -> int:
         pose_area=float(config_value(pose_config, "close_area", 0.1)),
         hand_area=float(config_value(hand_config, "close_area", 0.01)),
         face_area=float(config_value(face_config, "close_area", 0.025)),
+    )
+    confidences = DetectionConfidences(
+        pose_detection=confidence_value(pose_config, "min_detection_confidence"),
+        pose_tracking=confidence_value(pose_config, "min_tracking_confidence"),
+        hand_detection=confidence_value(hand_config, "min_detection_confidence"),
+        hand_tracking=confidence_value(hand_config, "min_tracking_confidence"),
+        face_detection=confidence_value(face_config, "min_detection_confidence"),
+        face_tracking=confidence_value(face_config, "min_tracking_confidence"),
     )
     if args.mode not in {"viewer", "hand-control"}:
         logging.error("%s mode is not implemented yet.", args.mode)
@@ -123,8 +135,7 @@ def main() -> int:
                     cap,
                     str(config_value(mode_config, "window_title", "Camera Feed")),
                     thresholds,
-                    float(config_value(mode_config, "min_detection_confidence", 0.5)),
-                    float(config_value(mode_config, "min_tracking_confidence", 0.5)),
+                    confidences,
                     flags,
                     str(config_value(mode_config, "window_position", "top-right")),
                 )
@@ -133,10 +144,11 @@ def main() -> int:
 
                 return_code = HandControlMode(
                     HandControlConfig(
-                        min_detection_confidence=float(config_value(mode_config, "min_detection_confidence", 0.5)),
-                        min_tracking_confidence=float(config_value(mode_config, "min_tracking_confidence", 0.5)),
+                        min_detection_confidence=confidence_value(pose_config, "min_detection_confidence"),
+                        min_tracking_confidence=confidence_value(pose_config, "min_tracking_confidence"),
                         click_hold_seconds=float(config_value(mode_config, "click_hold_seconds", 1.5)),
                         click_radius=float(config_value(mode_config, "click_radius", 0.025)),
+                        click_grace_seconds=float(config_value(mode_config, "click_grace_seconds", 0.25)),
                         click_cooldown_seconds=float(config_value(mode_config, "click_cooldown_seconds", 3.0)),
                         wave_window_seconds=float(config_value(mode_config, "wave_window_seconds", 1.2)),
                         wave_min_span=float(config_value(mode_config, "wave_min_span", 0.12)),
@@ -144,8 +156,31 @@ def main() -> int:
                         mouse_smoothing=float(config_value(mode_config, "mouse_smoothing", 0.4)),
                         mouse_deadzone=float(config_value(mode_config, "mouse_deadzone", 0.002)),
                         mouse_edge_padding=float(config_value(mode_config, "mouse_edge_padding", 0.005)),
+                        mouse_edge_padding_pixels=(
+                            int(mode_config["mouse_edge_padding_pixels"])
+                            if "mouse_edge_padding_pixels" in mode_config
+                            else None
+                        ),
+                        dwell_cursor_enabled=bool(config_value(mode_config, "dwell_cursor_enabled", True)),
+                        dwell_cursor_radius=(
+                            int(mode_config["dwell_cursor_radius"])
+                            if mode_config.get("dwell_cursor_radius") is not None
+                            else None
+                        ),
+                        dwell_cursor_diameter_pixels=int(
+                            config_value(mode_config, "dwell_cursor_diameter_pixels", 28)
+                        ),
+                        dwell_cursor_base_alpha=float(config_value(mode_config, "dwell_cursor_base_alpha", 0.4)),
+                        dwell_cursor_fill_alpha=float(config_value(mode_config, "dwell_cursor_fill_alpha", 0.9)),
+                        dwell_cursor_workspace_alpha=float(
+                            config_value(mode_config, "dwell_cursor_workspace_alpha", 0.1)
+                        ),
                         control_margin=float(config_value(mode_config, "control_margin", 0.08)),
                         control_gain=float(config_value(mode_config, "control_gain", 1.25)),
+                        control_acceleration=float(config_value(mode_config, "control_acceleration", 1.0)),
+                        control_acceleration_threshold=float(
+                            config_value(mode_config, "control_acceleration_threshold", 0.16)
+                        ),
                         window_position=str(config_value(mode_config, "window_position", "top-right")),
                         exit_hold_seconds=float(config_value(mode_config, "exit_hold_seconds", 0.6)),
                     )

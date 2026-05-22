@@ -21,6 +21,16 @@ class DetectionThresholds:
 
 
 @dataclass(frozen=True)
+class DetectionConfidences:
+    pose_detection: float
+    pose_tracking: float
+    hand_detection: float
+    hand_tracking: float
+    face_detection: float
+    face_tracking: float
+
+
+@dataclass(frozen=True)
 class DetectionFlags:
     pose: bool
     hand: bool
@@ -112,13 +122,11 @@ class LandmarkDetector:
         self,
         thresholds: DetectionThresholds,
         flags: DetectionFlags,
-        min_detection_confidence: float,
-        min_tracking_confidence: float,
+        confidences: DetectionConfidences,
     ) -> None:
         self.thresholds = thresholds
         self.flags = flags
-        self.min_detection_confidence = min_detection_confidence
-        self.min_tracking_confidence = min_tracking_confidence
+        self.confidences = confidences
         self.detection_states: dict[str, str] = {}
         self._stack = ExitStack()
         self.pose = None
@@ -129,16 +137,16 @@ class LandmarkDetector:
         if self.flags.pose:
             self.pose = self._stack.enter_context(
                 mp_pose.Pose(
-                    min_detection_confidence=self.min_detection_confidence,
-                    min_tracking_confidence=self.min_tracking_confidence,
+                    min_detection_confidence=self.confidences.pose_detection,
+                    min_tracking_confidence=self.confidences.pose_tracking,
                 )
             )
         if self.flags.hand:
             self.hands = self._stack.enter_context(
                 mp_hands.Hands(
                     max_num_hands=2,
-                    min_detection_confidence=self.min_detection_confidence,
-                    min_tracking_confidence=self.min_tracking_confidence,
+                    min_detection_confidence=self.confidences.hand_detection,
+                    min_tracking_confidence=self.confidences.hand_tracking,
                 )
             )
         if self.flags.face:
@@ -146,8 +154,8 @@ class LandmarkDetector:
                 mp_face.FaceMesh(
                     max_num_faces=1,
                     refine_landmarks=True,
-                    min_detection_confidence=self.min_detection_confidence,
-                    min_tracking_confidence=self.min_tracking_confidence,
+                    min_detection_confidence=self.confidences.face_detection,
+                    min_tracking_confidence=self.confidences.face_tracking,
                 )
             )
         return self

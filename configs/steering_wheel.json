@@ -4,8 +4,6 @@
   "height": 480,
   "window_title": "Camera Feed",
   "window_position": "top-right",
-  "min_detection_confidence": 0.5,
-  "min_tracking_confidence": 0.5,
   "native_logs": false,
   "verbose": false
 }
