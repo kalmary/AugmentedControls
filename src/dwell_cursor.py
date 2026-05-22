@@ -156,6 +156,11 @@ class DwellOverlay:
         painter.setPen(base_pen)
         painter.drawEllipse(circle)
 
+        dot_radius = max(round(self.diameter_pixels * 0.09), 3)
+        painter.setPen(self.Qt.PenStyle.NoPen)
+        painter.setBrush(self.QColor(255, 255, 255, 235))
+        painter.drawEllipse(self.QPointF(x, y), dot_radius, dot_radius)
+
         if self.progress <= 0.0:
             return
 

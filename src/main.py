@@ -181,6 +181,7 @@ def main() -> int:
                         control_acceleration_threshold=float(
                             config_value(mode_config, "control_acceleration_threshold", 0.16)
                         ),
+                        n_claps=int(config_value(mode_config, "n_claps", 1)),
                         window_position=str(config_value(mode_config, "window_position", "top-right")),
                         exit_hold_seconds=float(config_value(mode_config, "exit_hold_seconds", 0.6)),
                     )

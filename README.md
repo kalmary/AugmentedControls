@@ -44,6 +44,7 @@ It asks for remote mouse-control permission, tracks the body skeleton, then:
 - raise your right hand to accept the visible person as the controller
 - wave either wrist to select it for mouse control
 - point with the selected arm to steer the mouse
+- clap the configured number of times to pause tracking; clap again to resume
 - hold the pointer steady for `click_hold_seconds` from
   `configs/hand_control.json` to click
 - watch the dwell cursor circle fill to see when a click is about to fire
@@ -64,7 +65,8 @@ click indicator with `dwell_cursor_enabled`, `dwell_cursor_diameter_pixels`,
 `dwell_cursor_base_alpha`, `dwell_cursor_fill_alpha`, and
 `dwell_cursor_workspace_alpha`. Tune click forgiveness with `click_radius` and
 `click_grace_seconds`. Tune pointer acceleration with `control_acceleration`
-and `control_acceleration_threshold`.
+and `control_acceleration_threshold`. Tune the pause/resume clap count with
+`n_claps`.
 
 Put both hands near your chest in an X sign for a moment to close the app
 without pressing `q`.

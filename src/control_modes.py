@@ -42,6 +42,7 @@ class HandControlConfig:
     control_gain: float
     control_acceleration: float
     control_acceleration_threshold: float
+    n_claps: int
     window_position: str
     exit_hold_seconds: float
 
@@ -85,6 +86,74 @@ class WaveTracker:
 
     def reset(self) -> None:
         self.samples.clear()
+
+
+@dataclass
+class ClapTracker:
+    n_claps: int
+    clap_window_seconds: float = 1.8
+    close_ratio: float = 0.5
+    release_ratio: float = 0.62
+    samples: list[float] = field(default_factory=list)
+    hands_closed: bool = False
+
+    def __post_init__(self) -> None:
+        self.clap_window_seconds = max(self.clap_window_seconds, self.n_claps * 0.65)
+
+    def update(self, now: float, pose_landmarks) -> bool:
+        if self.n_claps <= 0:
+            return False
+
+        distance_ratio = self._wrist_distance_ratio(pose_landmarks)
+        if distance_ratio is None:
+            self._clear_old_samples(now)
+            return False
+
+        if self.hands_closed:
+            if distance_ratio >= self.release_ratio:
+                self.hands_closed = False
+            self._clear_old_samples(now)
+            return False
+
+        if distance_ratio > self.close_ratio:
+            self._clear_old_samples(now)
+            return False
+
+        self.hands_closed = True
+        self.samples.append(now)
+        self._clear_old_samples(now)
+        if len(self.samples) < self.n_claps:
+            return False
+
+        self.reset(require_release=True)
+        return True
+
+    def reset(self, require_release: bool = False) -> None:
+        self.samples.clear()
+        self.hands_closed = require_release
+
+    def _clear_old_samples(self, now: float) -> None:
+        cutoff = now - self.clap_window_seconds
+        self.samples = [sample_time for sample_time in self.samples if sample_time >= cutoff]
+
+    @staticmethod
+    def _wrist_distance_ratio(pose_landmarks) -> float | None:
+        left_wrist = pose_landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
+        right_wrist = pose_landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+        left_shoulder = pose_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = pose_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+
+        if left_wrist.visibility < 0.35 or right_wrist.visibility < 0.35:
+            return None
+        if left_shoulder.visibility < 0.4 or right_shoulder.visibility < 0.4:
+            return None
+
+        shoulder_width = max(abs(left_shoulder.x - right_shoulder.x), 0.08)
+        wrist_distance = (
+            (left_wrist.x - right_wrist.x) ** 2
+            + (left_wrist.y - right_wrist.y) ** 2
+        ) ** 0.5
+        return wrist_distance / shoulder_width
 
 
 class DwellClicker:
@@ -230,15 +299,22 @@ class AdaptiveControlMapper:
 
 
 class HandControlMode:
+    HAND_TRACKING_VISIBILITY = 0.28
+    HAND_WAVE_VISIBILITY = 0.35
+    SHOULDER_TRACKING_VISIBILITY = 0.4
+    EXIT_GESTURE_VISIBILITY = 0.58
+
     def __init__(self, config: HandControlConfig) -> None:
         self.config = config
         self.user_accepted = False
         self.active_hand_label: str | None = None
+        self.tracking_paused = False
         self.pose_visible = False
         self.wave_trackers = {
             "Left": WaveTracker(),
             "Right": WaveTracker(),
         }
+        self.clap_tracker = ClapTracker(max(config.n_claps, 0))
         self.dwell_clicker = DwellClicker(
             config.click_hold_seconds,
             config.click_radius,
@@ -352,6 +428,9 @@ class HandControlMode:
         if self._crossed_arms_exit_held(pose_landmarks.landmark, now):
             return True
 
+        if self._handle_clap_toggle(pose_landmarks.landmark, now, mouse_controller, dwell_overlay):
+            return False
+
         arms = {
             "Left": (
                 pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_SHOULDER],
@@ -363,10 +442,15 @@ class HandControlMode:
             ),
         }
 
+        if self.tracking_paused:
+            if dwell_overlay:
+                dwell_overlay.hide()
+            return False
+
         self._forget_active_hand_if_lost(arms)
 
         for label, (_, hand) in arms.items():
-            if hand.visibility < 0.5:
+            if hand.visibility < self.HAND_WAVE_VISIBILITY:
                 continue
 
             tracker = self.wave_trackers.get(label)
@@ -434,7 +518,7 @@ class HandControlMode:
             return
 
         _, hand = active_arm
-        if hand.visibility < 0.5:
+        if hand.visibility < self.HAND_TRACKING_VISIBILITY:
             self._forget_active_hand("Selected hand tracking lost; wave again to select a hand.")
 
     def _forget_active_hand(self, message: str) -> None:
@@ -451,6 +535,29 @@ class HandControlMode:
     def _reset_click_state(self) -> None:
         self.dwell_clicker.anchor = None
         self.dwell_clicker.outside_since = None
+
+    def _handle_clap_toggle(
+        self,
+        pose_landmarks,
+        now: float,
+        mouse_controller: MouseController,
+        dwell_overlay: DwellOverlay | None,
+    ) -> bool:
+        if not self.clap_tracker.update(now, pose_landmarks):
+            return False
+
+        self.tracking_paused = not self.tracking_paused
+        mouse_controller.reset_smoothing()
+        self.control_mapper.reset()
+        self._reset_click_state()
+        if dwell_overlay:
+            dwell_overlay.hide()
+
+        if self.tracking_paused:
+            logging.info("Hand tracking paused. Clap again to resume.")
+        else:
+            logging.info("Hand tracking resumed.")
+        return True
 
     @staticmethod
     def _hand_point(pose_landmarks, physical_label: str) -> TrackedPoint:
@@ -485,7 +592,10 @@ class HandControlMode:
 
     @staticmethod
     def _arm_pointing_position(shoulder, hand) -> tuple[float, float] | None:
-        if shoulder.visibility < 0.5 or hand.visibility < 0.5:
+        if (
+            shoulder.visibility < HandControlMode.SHOULDER_TRACKING_VISIBILITY
+            or hand.visibility < HandControlMode.HAND_TRACKING_VISIBILITY
+        ):
             return None
 
         direction_x = hand.x - shoulder.x
@@ -503,6 +613,9 @@ class HandControlMode:
     def _draw_mode_status(self, frame) -> None:
         if not self.pose_visible:
             status = "HAND CONTROL: no body detected"
+            color = (60, 180, 255)
+        elif self.tracking_paused:
+            status = "HAND CONTROL: paused - clap to resume"
             color = (60, 180, 255)
         elif not self.user_accepted:
             status = "HAND CONTROL: body detected - raise right hand"
@@ -549,7 +662,10 @@ class HandControlMode:
         left_shoulder = pose_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
 
-        if left_wrist.visibility < 0.55 or right_wrist.visibility < 0.55:
+        if (
+            left_wrist.visibility < HandControlMode.EXIT_GESTURE_VISIBILITY
+            or right_wrist.visibility < HandControlMode.EXIT_GESTURE_VISIBILITY
+        ):
             return False
         if left_shoulder.visibility < 0.5 or right_shoulder.visibility < 0.5:
             return False
@@ -565,15 +681,21 @@ class HandControlMode:
             and shoulder_left_x - shoulder_width * 0.2 <= right_wrist.x <= shoulder_right_x + shoulder_width * 0.2
         )
         wrists_near_chest = (
-            shoulder_y - 0.14 <= left_wrist.y <= shoulder_y + 0.55
-            and shoulder_y - 0.14 <= right_wrist.y <= shoulder_y + 0.55
+            shoulder_y - 0.1 <= left_wrist.y <= shoulder_y + 0.28
+            and shoulder_y - 0.1 <= right_wrist.y <= shoulder_y + 0.28
         )
         wrists_close_together = (
             abs(left_wrist.x - right_wrist.x) <= shoulder_width * 0.65
             and abs(left_wrist.y - right_wrist.y) <= shoulder_width * 0.45
             and abs(((left_wrist.x + right_wrist.x) / 2.0) - chest_center_x) <= shoulder_width * 0.35
         )
-        return wrists_inside_chest_width and wrists_near_chest and wrists_close_together
+        arms_cross = HandControlMode._segments_intersect(
+            (left_shoulder.x, left_shoulder.y),
+            (left_wrist.x, left_wrist.y),
+            (right_shoulder.x, right_shoulder.y),
+            (right_wrist.x, right_wrist.y),
+        )
+        return wrists_inside_chest_width and wrists_near_chest and wrists_close_together and arms_cross
 
     @staticmethod
     def _segments_intersect(
